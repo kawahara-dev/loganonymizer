@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ログ匿名化ツール</title>
+<style>
+:root { color-scheme: light; font-family: system-ui, sans-serif; color: #172f33; background: #eef3f2; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(100% - 2rem, 60rem); margin: 2.5rem auto; }
+header { margin-bottom: 1.6rem; }
+h1, h2, p { margin: 0 0 .8rem; }
+h1 { font-size: clamp(1.65rem, 5vw, 2.5rem); }
+h2 { font-size: 1.2rem; }
+section { background: white; border: 1px solid #c9d9d6; border-radius: 1rem; padding: clamp(1rem, 4vw, 1.6rem); margin-bottom: 1rem; }
+small, .muted { color: #425b5e; }
+.notice { background: #fff6db; border-left: 4px solid #a66b15; padding: .65rem .85rem; }
+textarea, pre { width: 100%; padding: .75rem; background: #f6f9f8; border: 1px solid #acbfbc; border-radius: .5rem; font: .9rem/1.6 ui-monospace, monospace; }
+textarea { min-height: 12rem; resize: vertical; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; max-height: 26rem; }
+button { border: 1px solid #52736e; border-radius: .5rem; background: white; color: inherit; padding: .5rem .85rem; font: inherit; cursor: pointer; }
+button.primary, button[aria-pressed="true"] { background: #14574e; color: white; }
+button:disabled { opacity: .55; cursor: default; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .75rem 0; }
+.toolbar p { margin: 0; }
+article { border-top: 1px solid #d8e4e1; padding: .8rem 0; overflow-wrap: anywhere; }
+article p { margin: 0 0 .35rem; }
+summary { cursor: pointer; }
+mark { background: #ffdf86; color: #271b00; }
+.error { color: #961b19; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+<header><h1>ログ匿名化ツール</h1><p>端末内でログを検出し、承認した候補を置換します。</p><p class="muted"><small>バージョン v1.0.0</small></p></header>
+<section aria-labelledby="input-heading">
+<h2 id="input-heading">1. 入力・検出</h2>
+<p class="notice">検出・置換できる情報には限りがあり、完全な情報漏えい防止は保証しません。共有前に結果全体を確認し、所属組織のルールに従ってください</p>
+<p><strong>対象</strong> IPv4、IPv6、メール、明示欄のホスト名、AWSアカウントID</p>
+<p class="muted"><strong>対象外</strong> MAC、ARN全体、ユーザー名、独自ルール、複数ファイル、可逆モード・対応表・復元、確認省略、IPv6ゾーン識別子付きアドレス、認証情報など</p>
+<label for="log">ログを貼り付け（UTF-8で最大1,000,000バイト）</label>
+<textarea id="log" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" aria-describedby="size input-error"></textarea>
+<div class="toolbar"><button id="detect" class="primary">検出</button><button id="clear">クリア</button><p id="size">0 / 1,000,000 バイト</p></div>
+<p id="input-error" class="error" role="alert" hidden></p>
+</section>
+<section id="review" aria-labelledby="review-heading" hidden>
+<h2 id="review-heading">2. 候補一覧・承認／除外</h2>
+<p>同じ種別・原文の出現箇所はまとめて扱います。未確認の箇所はそのまま残ります。</p>
+<p id="counts" role="status"></p>
+<p id="conflict" class="error" role="alert" hidden></p>
+<div id="candidates"></div>
+<div id="pages" class="toolbar" hidden><button id="prev">前へ</button><span id="page"></span><button id="next">次へ</button></div>
+<button id="replace" class="primary">承認済みを置換してプレビュー</button>
+</section>
+<section id="result" aria-labelledby="result-heading" hidden>
+<h2 id="result-heading" tabindex="-1">3. 結果・コピー</h2>
+<p class="notice">検出・置換できる情報には限りがあり、完全な情報漏えい防止は保証しません。共有前に結果全体を確認し、所属組織のルールに従ってください</p>
+<p id="result-count"></p>
+<pre id="preview" tabindex="0" aria-label="結果プレビュー"></pre>
+<button id="copy" class="primary">結果をコピー</button>
+<p id="copy-status" role="status"></p>
+<div id="manual" hidden><label for="copy-text">手動コピー用の結果（選択してコピー）</label><textarea id="copy-text" readonly spellcheck="false"></textarea></div>
+</section>
+</main>
+<script>
+// === 検出エンジン開始 ===
+const LIMIT = 1_000_000;
+const LIMIT_ERROR = '1,000,000バイトを超えています。ログの範囲を縮めてください。';
+const byteLength = input => new TextEncoder().encode(input).length;
+
+function ipv4(value) {
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return null;
+  const octets = value.split('.').map(Number);
+  return octets.every(octet => octet <= 255) ? octets : null;
+}
+
+function ipv6(value) {
+  if (!value.includes(':')) return null;
+  if (value.includes('.')) {
+    const end = value.lastIndexOf(':') + 1;
+    const tail = value.slice(end);
+    const octets = ipv4(tail);
+    if (!octets || tail.split('.').some(part => part.length > 1 && part.startsWith('0'))) return null;
+    value = value.slice(0, end) + [octets[0] * 256 + octets[1], octets[2] * 256 + octets[3]]
+      .map(word => word.toString(16)).join(':');
+  }
+  const halves = value.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const count = left.length + right.length;
+  if (![...left, ...right].every(word => /^[\da-f]{1,4}$/i.test(word))) return null;
+  if (halves.length === 1 ? count !== 8 : count >= 8) return null;
+  return [...left, ...Array(8 - count).fill('0'), ...right].map(word => parseInt(word, 16));
+}
+
+function classify4([a, b, c, d]) {
+  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 'PRIVATE_IP';
+  if ((a === 192 && b === 0 && c === 0 && (d === 9 || d === 10))) return 'PUBLIC_IP';
+  if (a === 0 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 192 && b === 88 && c === 99) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113)) return 'IPV4';
+  return 'PUBLIC_IP';
+}
+
+function classify6([a, b, c]) {
+  if ((a & 0xfe00) === 0xfc00) return 'PRIVATE_IP';
+  if ((a & 0xe000) !== 0x2000 ||
+      (a === 0x2001 && (b < 0x200 || b === 0xdb8)) ||
+      a === 0x2002 || a === 0x3ffe || (a === 0x3fff && b < 0x1000) ||
+      (a === 0x2620 && b === 0x4f && c === 0x8000)) return 'IPV6';
+  return 'PUBLIC_IP';
+}
+
+function withoutTrailingDots(value) {
+  let end = value.length;
+  while (value[end - 1] === '.') end--;
+  return value.slice(0, end);
+}
+
+function dnsName(value) {
+  return value.length <= 253 && value.split('.').every(label =>
+    /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label));
+}
+
+function detect(input) {
+  if (byteLength(input) > LIMIT) throw new RangeError(LIMIT_ERROR);
+  const hits = [];
+  const mailRanges = [];
+  const ipv6Ranges = [];
+  const add = (type, start, original, reason, weak = false) =>
+    hits.push({ type, start, end: start + original.length, original, reason, weak });
+  // 各範囲リストは抽出順で、照会位置も昇順。
+  const overlaps = ranges => {
+    let index = 0;
+    return (start, end) => {
+      while (index < ranges.length && ranges[index].end <= start) index++;
+      return index < ranges.length && ranges[index].start < end;
+    };
+  };
+  const field = start => {
+    const prefix = input.slice(Math.max(0, start - 128), start);
+    return /(?:^|[^\w.-])["']?([a-z][\w.-]*)["']?[ \t]*[=:][ \t]*["']?$/i.exec(prefix)?.[1].toLowerCase();
+  };
+
+  for (const match of input.matchAll(/(?<![a-z\d.!#$%&'*+\/=?^_`{|}~-])[a-z\d.!#$%&'*+\/=?^_`{|}~-]+@[a-z\d.-]+/gi)) {
+    // '=' はメールにも使えるため、明示のログ欄に限って欄名を外す。
+    const prefix = /^(?:email|mail|from|to|sender|recipient|recipients|cc|bcc|user|username|host|hostname|dst_host|src_host)=/i.exec(match[0])?.[0] ?? '';
+    const original = withoutTrailingDots(match[0].slice(prefix.length));
+    if (original.length > 254) continue;
+    const [local, domain] = original.split('@');
+    const start = match.index + prefix.length;
+    if (!local || local.length > 64 || local.startsWith('.') || local.endsWith('.') ||
+        local.includes('..') || !domain.includes('.') || !dnsName(domain) ||
+        !/^[a-z][a-z\d-]*$/i.test(domain.split('.').at(-1)) ||
+        /[@_-]/.test(input[start + original.length] ?? '')) continue;
+    add('EMAIL', start, original, 'メールの典型形式');
+    mailRanges.push({ start, end: start + original.length });
+  }
+
+  const inMail6 = overlaps(mailRanges);
+  // 角括弧やポートの区切りを範囲に含めず、ゾーン付きの値は範囲ごと除外。
+  for (const match of input.matchAll(/[a-f\d:][a-f\d:.]*(?:%[\w.~%-]+)?/gi)) {
+    const original = withoutTrailingDots(match[0]);
+    const start = match.index;
+    const end = start + original.length;
+    if (!original.includes(':') || original.length < 2 || inMail6(start, end) ||
+        /[\w%:]/.test(input[start - 1] ?? '') || /[\w%:]/.test(input[end] ?? '')) continue;
+    const address = original.slice(0, original.includes('%') ? original.indexOf('%') : original.length);
+    if (address.length > 45) continue;
+    const words = ipv6(address);
+    if (!words) continue;
+    ipv6Ranges.push({ start, end });
+    if (!original.includes('%')) add(classify6(words), start, original, 'IPv6の構文に一致');
+  }
+
+  const inMail4 = overlaps(mailRanges);
+  const inIPv6 = overlaps(ipv6Ranges);
+  for (const match of input.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)) {
+    const [original] = match;
+    const start = match.index;
+    const end = start + original.length;
+    const octets = ipv4(original);
+    if (!octets || /[\d.]/.test(input[start - 1] ?? '') ||
+        /[\d.]/.test(input[end] ?? '') ||
+        inMail4(start, end) || inIPv6(start, end)) continue;
+    const key = field(start);
+    const explicit = /^(?:src|dst|source|destination|ip|src_ip|dst_ip|client_ip|remote_addr|local_addr|address)$/.test(key ?? '');
+    const version = !explicit && (/^(?:version|ver|firmware|fw_version)$/.test(key ?? '') ||
+      /(?:^|[^\w])v$/i.test(input.slice(Math.max(0, start - 2), start)));
+    const identifier = /[a-zA-Z]/.test(input[start - 1] ?? '');
+    add(classify4(octets), start, original, version ? '版番号の可能性（低確度）' :
+      identifier ? '識別子の一部の可能性（低確度）' :
+      explicit ? '明示のIP欄' : 'IPv4の構文に一致', version || identifier);
+  }
+
+  const inMailHost = overlaps(mailRanges);
+  const inIPv6Host = overlaps(ipv6Ranges);
+  for (const match of input.matchAll(/(?:^|[^\w.-])["']?(?:host|hostname|src_host|dst_host|server_name)["']?[ \t]*[=:][ \t]*["']?([a-z\d.-]+)/gi)) {
+    const original = withoutTrailingDots(match[1]);
+    const start = match.index + match[0].length - match[1].length;
+    const end = start + original.length;
+    if (dnsName(original) && !ipv4(original) &&
+        !/^(?:[\w@-]|\.[\w.])/.test(input.slice(end, end + 2)) &&
+        !inMailHost(start, end) && !inIPv6Host(start, end)) add('HOST', start, original, '明示のホスト名欄');
+  }
+
+  const inMailAccount = overlaps(mailRanges);
+  for (const match of input.matchAll(/\d{12}/g)) {
+    const [original] = match;
+    const start = match.index;
+    const end = start + original.length;
+    if (/[a-z\d_]/i.test(input[start - 1] ?? '') || /[a-z\d_]/i.test(input[end] ?? '') ||
+        inMailAccount(start, end)) continue;
+    const key = field(start);
+    const arn = /(?:^|[^\w-])arn:[a-z\d-]+:[a-z\d-]+:[a-z\d-]*:$/i
+      .test(input.slice(Math.max(0, start - 128), start)) && /^:[^\s"',;\]]/.test(input.slice(end, end + 2));
+    if (arn) continue;
+    const explicit = /^(?:account_id|accountid|aws_account_id|awsaccountid|account)$/.test(key ?? '');
+    if (!explicit && /^(?:time|timestamp|request[-_]?id|req[-_]?id|trace[-_]?id|event[-_]?time|ts)$/.test(key ?? '')) continue;
+    add('AWS_ACCOUNT', start, original,
+      explicit ? '明示のアカウント欄' : '文脈のない12桁の数字（低確度）', !explicit);
+  }
+
+  const reserved = new Set(Array.from(input.matchAll(/\b(?:PRIVATE_IP|PUBLIC_IP|IPV4|IPV6|EMAIL|HOST|AWS_ACCOUNT)_\d{3,}\b/g), match => match[0]));
+  const nextNumber = new Map();
+  const groups = new Map();
+  hits.sort((a, b) => a.start - b.start || b.end - a.end);
+  let line = 1;
+  const newline = /\r\n?|\n/g;
+  let nextBreak = newline.exec(input);
+  for (const { type, original, start, end, reason, weak } of hits) {
+    while (nextBreak && nextBreak.index < start) {
+      line++;
+      nextBreak = newline.exec(input);
+    }
+    const key = type + ':' + original;
+    if (!groups.has(key)) {
+      let number = nextNumber.get(type) ?? 1;
+      let token;
+      do {
+        token = type + '_' + String(number++).padStart(3, '0');
+      } while (reserved.has(token));
+      nextNumber.set(type, number);
+      groups.set(key, { id: groups.size, type, original, token, occurrences: [] });
+    }
+    groups.get(key).occurrences.push({ start, end, line, reason, weak });
+  }
+  return [...groups.values()];
+}
+
+function approvedRanges(candidates, approved, excludedOccurrences) {
+  const ranges = candidates.flatMap(candidate => approved.has(candidate.id)
+    ? candidate.occurrences.flatMap(({ start, end }, index) =>
+      excludedOccurrences.has(`${candidate.id}:${index}`) ? [] : [{ start, end, token: candidate.token }])
+    : []).sort((a, b) => a.start - b.start);
+  if (ranges.some((range, index) => index > 0 && ranges[index - 1].end > range.start)) {
+    throw new RangeError('承認した候補の検出範囲が重なっています。先に片方を除外してください。');
+  }
+  return ranges;
+}
+
+function replaceApproved(input, candidates, approved, excludedOccurrences = new Set()) {
+  const parts = [];
+  let cursor = 0;
+  for (const { start, end, token } of approvedRanges(candidates, approved, excludedOccurrences)) {
+    parts.push({ text: input.slice(cursor, start), replaced: false }, { text: token, replaced: true });
+    cursor = end;
+  }
+  parts.push({ text: input.slice(cursor), replaced: false });
+  return { parts, text: parts.map(part => part.text).join('') };
+}
+// === 検出エンジン終了 ===
+</script>
+<script>
+const byId = id => document.getElementById(id);
+const log = byId('log');
+const review = byId('review');
+const result = byId('result');
+const list = byId('candidates');
+const preview = byId('preview');
+const conflict = byId('conflict');
+const approved = new Set();
+const excluded = new Set();
+const excludedOccurrences = new Set();
+const pageSize = 25;
+let page = 0;
+let candidates = [];
+let source = '';
+let output = '';
+let resultRevision = 0;
+
+function element(tag, value) {
+  const node = document.createElement(tag);
+  node.textContent = value;
+  return node;
+}
+
+function resetResult() {
+  resultRevision++;
+  output = '';
+  result.hidden = true;
+  preview.replaceChildren();
+  byId('copy-status').textContent = '';
+  byId('result-count').textContent = '';
+  byId('copy-text').value = '';
+  byId('manual').hidden = true;
+}
+
+function updateInput() {
+  const bytes = byteLength(log.value);
+  byId('size').textContent = bytes.toLocaleString('ja-JP') + ' / 1,000,000 バイト';
+  byId('input-error').textContent = bytes > LIMIT ? LIMIT_ERROR : '';
+  byId('input-error').hidden = bytes <= LIMIT;
+  byId('detect').disabled = bytes > LIMIT || bytes === 0;
+  review.hidden = true;
+  conflict.hidden = true;
+  source = '';
+  page = 0;
+  candidates = [];
+  approved.clear();
+  excluded.clear();
+  excludedOccurrences.clear();
+  list.replaceChildren();
+  resetResult();
+}
+
+function renderCounts() {
+  byId('counts').textContent = candidates.length
+    ? `候補 ${candidates.length}件 ／ 承認 ${approved.size}件 ／ 除外 ${excluded.size}件 ／ 未確認 ${candidates.length - approved.size - excluded.size}件`
+    : '候補は0件です。結果全体を確認してから共有してください。';
+}
+
+function addContext(article, candidate) {
+  const details = element('details', '');
+  details.append(element('summary', '行番号と前後の文脈'));
+  const contexts = element('div', '');
+  let shown = 0;
+  const more = element('button', '次の50箇所を表示');
+
+  function appendContexts() {
+    const endIndex = Math.min(shown + 50, candidate.occurrences.length);
+    for (let index = shown; index < endIndex; index++) {
+      const { start, end, line, reason } = candidate.occurrences[index];
+      const before = source.slice(Math.max(0, start - 90), start);
+      const after = source.slice(end, end + 90);
+      const excerpt = element('pre', '');
+      excerpt.append(before, element('mark', candidate.original), after);
+      const key = `${candidate.id}:${index}`;
+      const toggle = element('button', '');
+      function renderToggle() {
+        toggle.textContent = excludedOccurrences.has(key) ? 'この箇所の除外を解除' : 'この箇所を除外';
+      }
+      toggle.addEventListener('click', () => {
+        conflict.hidden = true;
+        if (excludedOccurrences.delete(key)) {
+          try {
+            approvedRanges(candidates, approved, excludedOccurrences);
+          } catch (error) {
+            excludedOccurrences.add(key);
+            conflict.textContent = error.message;
+            conflict.hidden = false;
+            return;
+          }
+        } else {
+          excludedOccurrences.add(key);
+        }
+        resetResult();
+        renderToggle();
+      });
+      renderToggle();
+      contexts.append(element('p', `${line}行目 ｜ ${reason}`), excerpt, toggle);
+    }
+    shown = endIndex;
+    more.hidden = shown >= candidate.occurrences.length;
+  }
+
+  more.hidden = true;
+  more.addEventListener('click', appendContexts);
+  details.addEventListener('toggle', () => {
+    if (details.open && shown === 0) appendContexts();
+  });
+  details.append(contexts, more);
+  article.append(details);
+}
+
+function renderPage() {
+  list.replaceChildren();
+  const totalPages = Math.ceil(candidates.length / pageSize);
+  byId('pages').hidden = totalPages <= 1;
+  byId('page').textContent = `${page + 1} / ${totalPages}`;
+  byId('prev').disabled = page === 0;
+  byId('next').disabled = page + 1 >= totalPages;
+
+  for (const candidate of candidates.slice(page * pageSize, (page + 1) * pageSize)) {
+    const { id, type, original, token, occurrences } = candidate;
+    const article = element('article', '');
+    const heading = element('p', '');
+    heading.append(element('strong', type), ' ', element('code', original), ' → ', element('code', token));
+    const reasons = new Set(occurrences.map(item => item.reason));
+    article.append(heading, element('p', `${occurrences.length}箇所 ｜ ${[...reasons].join('、')}`));
+    const actions = element('div', '');
+    actions.className = 'toolbar';
+    const accept = element('button', '承認');
+    const reject = element('button', '除外');
+    const undo = element('button', '未確認に戻す');
+    const status = element('span', '');
+    status.setAttribute('role', 'status');
+
+    function renderDecision() {
+      accept.setAttribute('aria-pressed', String(approved.has(id)));
+      reject.setAttribute('aria-pressed', String(excluded.has(id)));
+      undo.disabled = !approved.has(id) && !excluded.has(id);
+      status.textContent = approved.has(id) ? '承認済み' : excluded.has(id) ? '除外済み' : '未確認';
+    }
+
+    function decide(choice) {
+      conflict.hidden = true;
+      if (choice === 'approve' && !approved.has(id)) {
+        approved.add(id);
+        try {
+          approvedRanges(candidates, approved, excludedOccurrences);
+        } catch (error) {
+          approved.delete(id);
+          conflict.textContent = error.message;
+          conflict.hidden = false;
+          return;
+        }
+      } else if (choice !== 'approve') {
+        approved.delete(id);
+      }
+      excluded.delete(id);
+      if (choice === 'exclude') excluded.add(id);
+      resetResult();
+      renderDecision();
+      renderCounts();
+    }
+
+    accept.addEventListener('click', () => decide('approve'));
+    reject.addEventListener('click', () => decide('exclude'));
+    undo.addEventListener('click', () => decide('reset'));
+    renderDecision();
+    actions.append(accept, reject, undo, status);
+    article.append(actions);
+    addContext(article, candidate);
+    list.append(article);
+  }
+}
+
+log.addEventListener('input', updateInput);
+byId('clear').addEventListener('click', () => {
+  log.value = '';
+  updateInput();
+  log.focus();
+});
+byId('detect').addEventListener('click', () => {
+  updateInput();
+  if (byId('detect').disabled) return;
+  source = log.value;
+  candidates = detect(source);
+  renderCounts();
+  renderPage();
+  review.hidden = false;
+});
+byId('prev').addEventListener('click', () => { page--; renderPage(); });
+byId('next').addEventListener('click', () => { page++; renderPage(); });
+byId('replace').addEventListener('click', () => {
+  resetResult();
+  const replacement = replaceApproved(source, candidates, approved, excludedOccurrences);
+  output = replacement.text;
+  const fragment = document.createDocumentFragment();
+  let replaced = 0;
+  for (const part of replacement.parts) {
+    if (!part.text) continue;
+    if (part.replaced) {
+      fragment.append(element('mark', part.text));
+      replaced++;
+    } else {
+      fragment.append(part.text);
+    }
+  }
+  preview.append(fragment);
+  byId('result-count').textContent = `${replaced}箇所を置換。承認していない候補は ${candidates.length - approved.size}件です。`;
+  result.hidden = false;
+  byId('result-heading').focus();
+});
+byId('copy').addEventListener('click', async () => {
+  const revision = resultRevision;
+  try {
+    await navigator.clipboard.writeText(output);
+    if (revision === resultRevision) byId('copy-status').textContent = '結果をコピーしました。';
+  } catch {
+    if (revision !== resultRevision) return;
+    byId('copy-status').textContent = '自動コピーを利用できません。下の欄から手動でコピーしてください。';
+    const copyText = byId('copy-text');
+    copyText.value = output;
+    byId('manual').hidden = false;
+    copyText.focus();
+    copyText.select();
+  }
+});
+updateInput();
+</script>
+</body>
+</html>
